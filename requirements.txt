@@ -1,0 +1,5 @@
+docopt
+onetoken
+arrow
+websocket
+requests
