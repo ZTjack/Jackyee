@@ -1,3 +1,10 @@
+'''
+Author: Jack
+Date: 2020-11-16 18:08:11
+LastEditors: Jack
+LastEditTime: 2021-01-15 14:05:55
+Description: 
+'''
 import qbtrade as qb
 import qbxt
 import logging
@@ -9,6 +16,7 @@ import time
 import string
 import random
 import yaml
+
 
 class InfluxdbGeneralUDP:
     def __init__(self, host=None, port=None, auto_refresh_interval=0.1):
@@ -47,7 +55,8 @@ class InfluxdbGeneralUDP:
     @staticmethod
     def get_line(measurement, fields, tags, ts_ns):
         if tags:
-            tag_line = ''.join([f',{key}={value}' for key, value in tags.items()])
+            tag_line = ''.join(
+                [f',{key}={value}' for key, value in tags.items()])
         else:
             tag_line = ''
         if not fields:
@@ -85,13 +94,14 @@ class InfluxdbGeneralUDP:
                 if b * 1000 > 3:  # warn if > 3ms rquired
                     ms = round(b * 1000, 2)
                     print(f'long flush use {ms}ms', length)
-            except:
+            except Exception:
                 logging.exception('unexpected')
                 self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 self.sock.connect((self.host, self.port))
 
 
 influx_udp_client = InfluxdbGeneralUDP()
+
 
 class InfluxdbUdpGauge:
     def __init__(self, stid, host=None, port=None, measurement_prefix=False):
@@ -125,7 +135,8 @@ class InfluxdbUdpGauge:
         :return:
         """
 
-        influx_udp_client.add_point(self.measurement + '/' + key, fields, tags, ts)
+        influx_udp_client.add_point(self.measurement + '/' + key, fields, tags,
+                                    ts)
 
     # def get_line(self, key, fields, tags, ts):
     #     if tags:
@@ -135,6 +146,7 @@ class InfluxdbUdpGauge:
     #     if not fields:
     #         # print('ignore', fields)
     #         return ''
+
 
 class Order:
     def __init__(self):
@@ -209,10 +221,10 @@ class Strategy:
         if bbo.ask1 is None:
             logging.warning('ask1 none', bbo.contract, bbo.bid1, bbo.ask1)
             return
-        last_bbo = self.bbo.get(bbo.contract, None)
-        if last_bbo:
-            now = arrow.now().float_timestamp
-            # self.gauge('tk1-interval', (now - self.tk1.recv_time / 1e3) * 1e3)
+        # last_bbo = self.bbo.get(bbo.contract, None)
+        # if last_bbo:
+        # now = arrow.now().float_timestamp
+        # self.gauge('tk1-interval', (now - self.tk1.recv_time / 1e3) * 1e3)
         self.bbo[bbo.contract] = bbo
 
         # now = arrow.now().float_timestamp
@@ -307,7 +319,7 @@ class Strategy:
         # last_tk = self.ticks.get(tk.contract, None)
         # if last_tk:
         #     now = arrow.now().float_timestamp
-            # self.gauge('tk2-interval', (now - self.tk2.recv_time / 1e3) * 1e3)
+        # self.gauge('tk2-interval', (now - self.tk2.recv_time / 1e3) * 1e3)
         self.ticks[tk.contract] = tk
 
         # now = arrow.now().float_timestamp
@@ -336,15 +348,18 @@ class Strategy:
             over_due_time = arrow.now().shift(minutes=-30).float_timestamp
             for coid, o in self.active_orders.items():
                 if o.entrust_time < over_due_time:
-                    logging.warning(f'delete old order {o.bs} , {o.entrust_price}, {o.coid}, {o.eoid}')
+                    logging.warning(
+                        f'delete old order {o.bs} , {o.entrust_price}, {o.coid}, {o.eoid}'
+                    )
                     self.active_orders.pop(coid, None)
         asset, err = await self.acc.get_assets(contract=self.c1)
         if not err:
             for data in asset.data['assets']:
                 self.asset_by_rest[data['currency']] = data
             try:
-                total_amount = float(self.asset_by_rest[self.base_coin]['total_amount'])
-            except:
+                total_amount = float(
+                    self.asset_by_rest[self.base_coin]['total_amount'])
+            except Exception:
                 total_amount = 0
             self.gauge('position', total_amount)
             if self.base_amt and self.base_amt > 0:
@@ -354,7 +369,8 @@ class Strategy:
             logging.warning(err)
 
     def new_coid(self, con, bs):
-        return con + '-' + f'{bs}ooooo' + ''.join(random.choices(string.ascii_letters, k=10))
+        return con + '-' + f'{bs}ooooo' + ''.join(
+            random.choices(string.ascii_letters, k=10))
 
     def handle_remain_orders(self, bs, price):
         ideal_order_in_active = False
@@ -375,8 +391,10 @@ class Strategy:
                         qb.fut(self.cancel_order(coid=o.coid))
                     self.active_orders[coid].last_cancel_time = now
                     self.active_orders[coid].cancel_times += 1
-                    if self.active_orders[coid].cancel_times > self.max_cancel_times:
-                        logging.warning(f'{o.coid} {o.eoid} cancel times exceed limit')
+                    if self.active_orders[
+                            coid].cancel_times > self.max_cancel_times:
+                        logging.warning(
+                            f'{o.coid} {o.eoid} cancel times exceed limit')
                         self.active_orders.pop(o.coid, None)
 
         return ideal_order_in_active
@@ -387,14 +405,18 @@ class Strategy:
         elif coid:
             res, err = await self.acc.cancel_order(client_oid=coid)
         if err:
-            if err.code not in ['exg-okef-32004', qbxt.model.Error.EXG_CANCEL_ORDER_NOT_FOUND]:
+            if err.code not in [
+                    'exg-okef-32004',
+                    qbxt.model.Error.EXG_CANCEL_ORDER_NOT_FOUND
+            ]:
                 logging.warning(res, err, eoid, coid)
             #     if eoid:
             #         qb.fut(self.cancel_order_after_sleep(eoid=eoid, sleep=10))
             #     elif coid:
             #         qb.fut(self.cancel_order_after_sleep(coid=coid, sleep=10))
 
-    async def do_action(self, bs: str, price: float, amt: float, force_maker: bool):
+    async def do_action(self, bs: str, price: float, amt: float,
+                        force_maker: bool):
         ideal_order_in_active = self.handle_remain_orders(bs, price)
         if ideal_order_in_active:
             return
@@ -428,8 +450,12 @@ class Strategy:
         qb.fut(self.place_maker_order(o))
 
     async def place_maker_order(self, o: Order):
-        res, err = await self.acc.place_order(self.c1, price=o.entrust_price, bs=o.bs, amount=o.entrust_amount,
-                                   client_oid=o.coid, options=o.opt)
+        res, err = await self.acc.place_order(self.c1,
+                                              price=o.entrust_price,
+                                              bs=o.bs,
+                                              amount=o.entrust_amount,
+                                              client_oid=o.coid,
+                                              options=o.opt)
         if err:
             # 也有可能下单成功
             # del self.active_orders[o.coid]
