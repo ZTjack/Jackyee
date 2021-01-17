@@ -4,9 +4,20 @@ import logging
 import qbxt
 import arrow
 import time
+import random
+import string
 import socket
 from typing import Dict
 import asyncio
+
+
+class Extra:
+    def __init__(self):
+        self.tk1_bbo_place = None
+        self.tk2_bbo_place = None
+
+        self.tk1_bbo_dealt = None
+        self.tk2_bbo_dealt = None
 
 
 class Order:
@@ -166,6 +177,8 @@ class Config:
         self.contract1 = 'huobip/link.usdt'
         self.contract2 = 'huobip/bch.usdt'
         self.exchange = 'huobip'
+        # 假如设置为False，账户不会下单
+        self.trade = True
         # 一般是本位币的配置，可以gauge这个算balance
         self.base_coin = 'usdt'
         # 策略本位币数量
@@ -175,6 +188,14 @@ class Config:
         self.max_pending_orders: 5
         # 系统触发风控，系统会出于风控状态的默认时间
         self.cooldown_seconds = 10
+        # 一个单子允许撤销几次
+        self.cancel_order_interval = 1
+        # 一个单子允许撤销的次数
+        self.max_cancel_times = 3
+        # TODO
+        self.trade_interval = 3
+        # TODO
+        self.open_close_threshold = 5
 
     def set_key(self, k):
         self.key = k
@@ -208,6 +229,7 @@ class Config:
 class Strategy:
     def __init__(self, s_tid: str):
         self.s_tid = s_tid
+        self.inited = False
         self.config = Config()
         # gauge数据用到
         self.influxDb_udp = InfluxdbUdpGauge(self.s_tid,
@@ -240,6 +262,8 @@ class Strategy:
 
         # noqa 风控参数，假如触发分控，这个数值会被赋值，没到这个时间前为风控中状态
         self.rc_until = arrow.now()
+        # 上次order时间，风控用
+        self.last_trade_time = 0
 
     @property
     def contract1(self):
@@ -470,6 +494,10 @@ class Strategy:
     async def cancel_all(self):
         print('cancel all')
 
+    # 一般套利策略、对冲策略需要实现这个方法
+    async def match_pos(self):
+        print('match_pos')
+
     # 假如触发了风控,撤掉所有单子
     def rc_trigger(self, second, reason):
         if not self.rc_working:
@@ -477,6 +505,167 @@ class Strategy:
             logging.warning(f'rc trigger {reason} ${second} ${self.rc_until}')
             self.gauge('rc-work', 1, {'type': reason})
         self.rc_until = max(self.rc_until, arrow.now().shift(seconds=second))
+
+    # 撤单方法
+    async def cancel_order(self, eoid=None, coid=None):
+        print('cancel order')
+
+    # TODO 需要请教一波逻辑
+    def handle_remain_orders(self, bs, price):
+        ideal_order_in_active = False
+        for coid, o in list(self.active_orders.items()):
+            if bs != o.bs:
+                continue
+            # 一样的单子，last_cancel_time是None
+            if price == o.entrust_price and not o.last_cancel_time:
+                ideal_order_in_active = True
+            else:
+                now = arrow.now().float_timestamp
+                if not o.first_cancel_time:
+                    o.first_cancel_time = now
+                factor = self.active_orders[coid].cancel_time + 1
+                if not o.last_cancel_time or now - o.last_cancel_time > self.config.cancel_order_interval * factor:  # noqa
+                    if o.eoid:
+                        qb.fut(self.cancel_order(eoid=o.eoid))
+                    else:
+                        qb.fut(self.cancel_order(coid=o.coid))
+                    self.active_orders[coid].last_cancel_time = now
+                    self.active_orders[coid].cancel_times += 1
+                    if self.active_orders[
+                            coid].cancel_times > self.config.max_cancel_times:
+                        logging.warning(
+                            f'{o.coid} {o.eoid} cancel times exceed limit')
+                        self.active_orders.pop(o.coid, None)
+        return ideal_order_in_active
+
+    # 综合的riskcontrol状态
+    async def rc_work(self):
+        if not self.inited:
+            self.gauge('rc-work', 1, {'type': 'not-inited'})
+            return True
+        if self.acc.get_ws_state() != qbxt.const.WSState.READY:
+            self.gauge('rc-work', 1, {'type': 'acc-ws'})
+            return True
+        if self.quote.get_ws_state() != qbxt.const.WSState.READY:
+            self.gauge('rc-work', 1, {'type': 'quote-ws'})
+            return True
+        if not self.config.trade:
+            self.gauge('rc-work', 1, {'type': 'trade-off'})
+            return True
+        if self.rc_working:
+            return True
+
+    def get_order_options(self, contract, bs, amount, force_maker=False):
+        pos = self.pos_by_ws[contract]['detail']
+        opt = {}
+        open_close = 'open'
+        if force_maker:
+            opt['force_maker'] = True
+        # TODO add comments
+        if bs == 'b':
+            if float(pos['short_avail_qty']
+                     ) > amount * self.config.open_close_threshold:
+                open_close = 'close'
+        if bs == 's':
+            if float(pos['long_avail_qty']
+                     ) > amount * self.config.open_close_threshold:
+                open_close = 'close'
+        opt[open_close] = True
+        return opt
+
+    def new_coid(self, con, bs):
+        return con + '-' + f'{bs}ooooo' + ''.join(
+            random.choices(string.ascii_letters, k=10))
+
+    async def place_maker_order(self, order: Order):
+        print('place_maker_order')
+
+    async def do_action(self, contract: str, bs: str, price: float, amt: float,
+                        force_maker: bool):
+        print('do_action')
+        ideal_order_in_active = self.handle_remain_orders(bs, price)
+        if ideal_order_in_active:
+            return
+        if len(self.active_orders) > self.config.max_pending_orders:
+            return
+        now = arrow.now().float_timestamp
+        if now - self.last_trade_time < self.config.trade_interval:
+            return
+        else:
+            self.last_trade_time = now
+
+        if await self.rc_work():
+            return
+
+        opt = self.get_order_options(contract,
+                                     bs,
+                                     amt,
+                                     force_maker=force_maker)
+        coid = self.new_coid(contract, bs)
+        order = Order()
+        order.coid = coid
+        order.entrust_price = price
+        order.bs = bs
+        order.entrust_amount = amt
+        order.entrust_time = arrow.now().float_timestamp
+        order.opt = opt
+        ext = Extra()
+        ext.tk1_bbo_dealt = self.tk1
+        ext.tk2_bbo_dealt = self.tk2
+        order.extra = ext
+        self.active_orders[coid] = order
+        qb.fut(self.place_maker_order(order))
+
+    # 这个网格套利相关的逻辑代码在里面
+    async def main_callback(self):
+        if not self.inited:
+            return
+        value = {
+            'tk1-bid1': self.tk1.bid1,
+            'tk1-ask1': self.tk1.ask1,
+            'tk2-bid1': self.tk2.bid1,
+            'tk2-ask1': self.tk2.ask1,
+            'tk-diff': self.tk1.middle / self.tk2.middle,
+            'bid-d-ask': self.tk1.bid1 / self.tk2.ask1,
+            'ask-d-bid': self.tk1.ask1 / self.tk2.bid1
+        }
+        # gauge quote data
+        self.gauge('quote', value)
+        # 策略相关逻辑写到下面去↓↓↓↓↓↓↓↓↓↓↓↓↓↓
+
+        price = 1
+        amount = 1
+        # 触发下单
+        qb.fut(self.do_action(self.contract1, 'b', price, amount, False))
+
+    # 一般策略都是Tick触发，从bbo_update_q里面去拿
+    async def daemon_consume_update_bbo(self):
+        while True:
+            try:
+                await self.bbo_update_q.get()
+                await self.main_callback()
+            except Exception:
+                logging.warning('main_callback error')
+
+    async def run(self):
+        await self.init()
+        await self.update_info()
+        # 用rest结果初始化ws数据
+        self.asset_by_ws = self.asset_by_rest
+        self.pos_by_ws = self.pos_by_rest
+        # 先全撤
+        await self.cancel_all()
+        # 每次拿一下配置，方便
+        await self.config.sync()
+
+        self.inited = True
+
+        qb.fut(self.daemon_consume_update_bbo())
+
+        # 低频的风控操作
+        qb.fut(qb.autil.loop_call(self.update_info, 30, panic_on_fail=False))
+        qb.fut(qb.autil.loop_call(self.config.sync, 30))
+        qb.fut(qb.autil.loop_call(self.match_pos, 10))
 
 
 async def main():
