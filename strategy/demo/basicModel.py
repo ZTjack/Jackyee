@@ -166,6 +166,15 @@ class Config:
         self.contract1 = 'huobip/link.usdt'
         self.contract2 = 'huobip/bch.usdt'
         self.exchange = 'huobip'
+        # 一般是本位币的配置，可以gauge这个算balance
+        self.base_coin = 'usdt'
+        # 策略本位币数量
+        self.base_coin_amt = 0
+
+        # 允许最多的pending-order数量
+        self.max_pending_orders: 5
+        # 系统触发风控，系统会出于风控状态的默认时间
+        self.cooldown_seconds = 10
 
     def set_key(self, k):
         self.key = k
@@ -217,13 +226,20 @@ class Strategy:
         self.acc: qbxt.Account
         # 存放ws推送的资产
         self.asset_by_ws = {}
+        # rest存放资产
+        self.asset_by_rest = {}
         # 存放ws推送的持仓
         self.pos_by_ws = {}
+        # 存放rest获取的持仓数据
+        self.pos_by_rest = {}
 
         # 前端自己维护的ActiveOrders
         self.active_orders: Dict[str, Order] = {}
         # 存下单时候的价格，用来和实际ws推送的成交价格计算滑点
         self.dealt_info: Dict[str, float] = {}
+
+        # noqa 风控参数，假如触发分控，这个数值会被赋值，没到这个时间前为风控中状态
+        self.rc_until = arrow.now()
 
     @property
     def contract1(self):
@@ -240,6 +256,10 @@ class Strategy:
     @property
     def tk2(self) -> qbxt.model.BboUpdate:
         return self.bbo[self.contract2]
+
+    @property
+    def rc_working(self):
+        return arrow.now() < self.rc_until
 
     def gauge(self, key: str, value, tags=None, ts=None):
         assert self.s_tid
@@ -381,6 +401,82 @@ class Strategy:
             order_callback=self.order_callback)
         await asyncio.sleep(1)
         logging.info('account init complete')
+
+    # 相对低频的通过rest来完成的事情，比如说gauge收益，比较弱的风控
+    async def update_info(self):
+        len_active_orders = len(self.active_orders)
+        self.gauge('active-orders', len_active_orders)
+        # 假如委托数量多于程序最多数量
+        if len_active_orders > self.config.max_pending_orders:
+            # 处理30分钟前的单子
+            over_due_time = arrow.now().shift(minutes=-30).float_timestamp
+            for coid, o in self.active_orders.items():
+                if o.entrust_time < over_due_time:
+                    logging.warning(
+                        f'delete old order {o.bs}, {o.entrust_price}, {o.coid}, {o.eoid}'  # noqa
+                    )
+                    self.active_orders.pop(coid, None)
+        asset, err = await self.acc.get_assets(contract=self.contract1)
+        if not err:
+            for data in asset.data['assets']:
+                self.asset_by_rest[data['currency']] = data
+            try:
+                total_amount = float(
+                    self.asset_by_rest[self.config.base_coin]['total_amount'])
+            except Exception:
+                total_amount = 0
+            self.gauge('coin-amount', total_amount)
+            if self.config.base_coin_amt and self.config.base_coin_amt > 0:
+                self.gauge('profit-rate',
+                           total_amount / self.config.base_coin_amt)
+        else:
+            logging.warning('get assets error')
+            self.rc_trigger(self.config.cooldown_seconds, 'get-assets')
+
+        await self.update_position()
+
+    # 通过rest获取position参数，主要低频风控和收集信息
+    async def update_position(self):
+        pos1, err1 = await self.acc.get_positions(self.contract1, None)
+        if not err1:
+            for data in pos1.data['positions']:
+                self.pos_by_rest[data['contract']] = data
+            try:
+                pos1_amt = float(
+                    self.pos_by_rest[self.contract1]['total_amount'])
+            except Exception:
+                pos1_amt = 0
+            self.gauge("pos1_amount", pos1_amt)
+
+        else:
+            logging.warning('get position1 error')
+            self.rc_trigger(self.config.cooldown_seconds, 'get-position1')
+
+        pos2, err2 = await self.acc.get_positions(self.contract2, None)
+        if not err2:
+            for data in pos2.data['positions']:
+                self.pos_by_rest[data['contract']] = data
+            try:
+                pos2_amt = float(
+                    self.pos_by_rest[self.contract2]['total_amount'])
+            except Exception:
+                pos2_amt = 0
+            self.gauge("pos2_amount", pos2_amt)
+        else:
+            logging.warning('get position2 error')
+            self.rc_trigger(self.config.cooldown_seconds, 'get-position2')
+            return
+
+    async def cancel_all(self):
+        print('cancel all')
+
+    # 假如触发了风控,撤掉所有单子
+    def rc_trigger(self, second, reason):
+        if not self.rc_working:
+            qb.fut(self.cancel_all())
+            logging.warning(f'rc trigger {reason} ${second} ${self.rc_until}')
+            self.gauge('rc-work', 1, {'type': reason})
+        self.rc_until = max(self.rc_until, arrow.now().shift(seconds=second))
 
 
 async def main():
