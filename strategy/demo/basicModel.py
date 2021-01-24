@@ -262,6 +262,8 @@ class Strategy:
 
         # noqa 风控参数，假如触发分控，这个数值会被赋值，没到这个时间前为风控中状态
         self.rc_until = arrow.now()
+        # 上次cancel_all的时间
+        self.last_cancel_all_time = arrow.now()
         # 上次order时间，风控用
         self.last_trade_time = 0
 
@@ -492,7 +494,21 @@ class Strategy:
             return
 
     async def cancel_all(self):
-        print('cancel all')
+        now = arrow.now()
+        if now.shift(seconds=-10) < self.last_cancel_all_time:
+            return
+        self.last_cancel_all_time = now
+        for contract in self.contracts:
+            list, err = await self.acc.get_pending_list(contract=contract)
+            if err:
+                logging.warning(err)
+                return
+            for item in list.orders:
+                await asyncio.sleep(0.1)
+                res, err = await self.acc.cancel_order(item.exchange_oid)
+                if err:
+                    logging.warning(err)
+                    continue
 
     # 一般套利策略、对冲策略需要实现这个方法
     async def match_pos(self):
@@ -508,7 +524,13 @@ class Strategy:
 
     # 撤单方法
     async def cancel_order(self, eoid=None, coid=None):
-        print('cancel order')
+        if eoid:
+            res, err = await self.acc.cancel_order(exchange_oid=eoid)
+        elif coid:
+            res, err = await self.acc.cancel_order(client_oid=coid)
+        if err:
+            if err.code not in [qbxt.model.Error.EXG_CANCEL_ORDER_NOT_FOUND]:
+                logging.warning(res, err, eoid, coid)
 
     # TODO 需要请教一波逻辑
     def handle_remain_orders(self, bs, price):
@@ -577,12 +599,21 @@ class Strategy:
         return con + '-' + f'{bs}ooooo' + ''.join(
             random.choices(string.ascii_letters, k=10))
 
-    async def place_maker_order(self, order: Order):
-        print('place_maker_order')
+    async def place_maker_order(self, contract, order: Order):
+        res, err = await self.acc.place_order(contract,
+                                              price=order.entrust_price,
+                                              bs=order.bs,
+                                              amount=order.entrust_amount,
+                                              client_oid=order.coid,
+                                              options=order.opt)
+        if err:
+            self.rc_trigger(self.config.cooldown_seconds, 'place-maker-order')
+            return
+        if order.coid in self.active_orders.keys():
+            self.active_orders[order.coid].eoid = res.exchange_oid
 
     async def do_action(self, contract: str, bs: str, price: float, amt: float,
                         force_maker: bool):
-        print('do_action')
         ideal_order_in_active = self.handle_remain_orders(bs, price)
         if ideal_order_in_active:
             return
@@ -614,7 +645,7 @@ class Strategy:
         ext.tk2_bbo_dealt = self.tk2
         order.extra = ext
         self.active_orders[coid] = order
-        qb.fut(self.place_maker_order(order))
+        qb.fut(self.place_maker_order(contract, order))
 
     # 这个网格套利相关的逻辑代码在里面
     async def main_callback(self):
