@@ -173,7 +173,7 @@ class InfluxdbUdpGauge:
 # for gauge  end
 class Config:
     def __init__(self):
-        self.account_symbol = 'subdjw8'
+        self.account_symbol = 'huobip/subdjw8'
         self.contract1 = 'huobip/link.usdt'
         self.contract2 = 'huobip/bch.usdt'
         self.exchange = 'huobip'
@@ -324,16 +324,6 @@ class Strategy:
             if not self.bbo_update_q.empty():
                 self.bbo_update_q.get_nowait()
             self.bbo_update_q.put_nowait('update_bbo')
-
-    async def get_config_dict(self):
-        print('start get redis settings')
-        conn = await qb.util.get_async_redis_conn()
-        key = f"strategy:{self.s_tid}:config"
-        yml = await conn.get(key)
-        if yml:
-            return yaml.load(yml)
-        else:
-            qb.panic('no config found')
 
     async def asset_callback(self, asset: qbxt.model.Assets):
         for data in asset.data['assets']:
@@ -702,9 +692,7 @@ class Strategy:
 async def main():
     s_tid = 'st-jack-qbxt-demo'
     s = Strategy(s_tid=s_tid)
-    await s.get_config_dict()
-
-    # await s.init()
+    await s.init()
     # await s.update_info()
     # qb.fut(qb.autil.loop_call(s.update_info, 30, panic_on_fail=False))
     # qb.fut(s.do_action('b', 12, s.place_amt, False))
